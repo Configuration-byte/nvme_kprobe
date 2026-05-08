@@ -1,9 +1,11 @@
 // io_delay_kprobe.c - 通过 kprobe 拦截 nvme_complete_rq 实现 IO 延迟
 //
-// 原理：
-//   1. kprobe 拦截 nvme_complete_rq，保存请求，返回 1 跳过原函数
-//   2. 更新 req->deadline 阻止块层超时处理器介入
-//   3. hrtimer 到期后，disable_kprobe → 调用原函数 → enable_kprobe
+// 可行性分析：
+//   1. nvme_complete_rq 从中断上下文调用，req 此时有效
+//   2. 返回 1 跳过原函数，请求留在块层 in-flight 状态
+//   3. 定时器到期后，disable_kprobe → 调用原函数 → enable_kprobe
+//   4. 调用者（blk_execute_rq）在栈上 wait_for_completion_io 阻塞，栈始终有效
+//   5. 必须延长 req->deadline 阻止块层超时处理器触发 nvme_dev_disable
 //
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -20,8 +22,7 @@ MODULE_AUTHOR("IO Delay Module");
 MODULE_DESCRIPTION("IO delay via kprobe on nvme_complete_rq");
 MODULE_VERSION("1.0");
 
-// ==================== 配置参数 ====================
-static unsigned long delay_ns = 10000000UL;  // 默认 10ms
+static unsigned long delay_ns = 10000000UL;
 module_param(delay_ns, ulong, 0644);
 MODULE_PARM_DESC(delay_ns, "IO completion delay in nanoseconds");
 
@@ -36,6 +37,7 @@ MODULE_PARM_DESC(delay_enabled, "Enable/disable IO delay");
 // ==================== 数据结构 ====================
 struct delayed_req_entry {
 	struct request *req;
+	unsigned long deadline;		// 保存原始 deadline 用于恢复
 	struct list_head list;
 	ktime_t trigger_time;
 };
@@ -53,27 +55,15 @@ typedef void (*nvme_complete_rq_fn)(struct request *req);
 static struct io_delay_ctx {
 	struct list_head delay_list;
 	spinlock_t delay_lock;
-
 	struct hrtimer delay_timer;
 	ktime_t next_trigger;
-
 	struct io_delay_stats stats;
-
 	struct kmem_cache *entry_cache;
-
 	nvme_complete_rq_fn orig_complete;
 	struct kprobe kp;
 } g_ctx;
 
 // ==================== 核心处理函数 ====================
-
-// disable_kprobe 移除 int3，调用原函数，再恢复
-static void call_orig_complete(struct request *req)
-{
-	disable_kprobe(&g_ctx.kp);
-	g_ctx.orig_complete(req);
-	enable_kprobe(&g_ctx.kp);
-}
 
 static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 {
@@ -98,22 +88,23 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	}
 
 	entry->req = req;
+	entry->deadline = req->deadline;  // 保存原始 deadline
+
 	now = ktime_get();
 	cur_delay = READ_ONCE(delay_ns);
 	entry->trigger_time = ktime_add_ns(now, cur_delay);
 
-	// 关键：延长 req->deadline，阻止块层超时处理器取消此请求
+	// 关键修复：延长 deadline，阻止 blk_mq_timeout_work 触发
 	//
-	// 宕机根因：
-	//   kprobe 拦截 nvme_complete_rq 并返回 1 跳过原函数
-	//   → 请求在块层仍标记为 MQ_RQ_IN_FLIGHT
-	//   → 延迟期间，块层 blk_mq_timeout_work 发现 req->deadline 到期
-	//   → 调用 nvme_timeout → nvme_dev_disable → nvme_cancel_tagset
-	//   → 对所有 in-flight 请求调用 blk_mq_end_request
-	//   → blk_end_sync_rq 访问 req->end_io_data（指向调用者栈上的 completion）
-	//   → 调用者栈已被回收 → PTE=0 → 宕机
+	// 宕机链路（不加此修复时）：
+	//   kprobe 返回 1 → 请求仍 in-flight
+	//   → blk_mq_timeout_work 发现 deadline 到期
+	//   → nvme_timeout → nvme_dev_disable → nvme_cancel_tagset
+	//   → blk_mq_end_request → blk_end_sync_rq
+	//   → 访问 req->end_io_data（指向 blk_execute_rq 调用者栈上的 completion）
+	//   → 栈已回收 → PTE=0 → 宕机
 	//
-	// 修复：将 deadline 后移 delay + 1秒，确保超时处理器不会在延迟期间触发
+	// 修复：将 deadline 后移超过延迟时间，超时处理器不会触发
 	req->deadline += nsecs_to_jiffies(cur_delay) + HZ;
 
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
@@ -133,7 +124,19 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	hrtimer_start_range_ns(&g_ctx.delay_timer, entry->trigger_time,
 				0, HRTIMER_MODE_ABS);
 
-	return 1;
+	return 1;  // 跳过 nvme_complete_rq
+}
+
+// 调用原始 nvme_complete_rq
+// 时序保证：
+//   - 此时 kprobe 已被 disable_kprobe 临时移除（int3 已恢复为原指令）
+//   - 调用者（blk_execute_rq）仍在栈上 wait_for_completion_io 阻塞
+//   - req->deadline 已被延长，块层超时处理器不会介入
+static void call_orig_complete(struct request *req)
+{
+	disable_kprobe(&g_ctx.kp);
+	g_ctx.orig_complete(req);
+	enable_kprobe(&g_ctx.kp);
 }
 
 static void process_expired_entries(struct list_head *expired_list, int max_count)
@@ -211,8 +214,7 @@ static int __init io_delay_module_init(void)
 {
 	int ret;
 
-	pr_info("io_delay_kprobe: Initializing IO delay module\n");
-	pr_info("io_delay_kprobe: Default delay set to %lu ns\n", delay_ns);
+	pr_info("io_delay_kprobe: Initializing, delay=%lu ns\n", delay_ns);
 
 	INIT_LIST_HEAD(&g_ctx.delay_list);
 	spin_lock_init(&g_ctx.delay_lock);
@@ -226,10 +228,8 @@ static int __init io_delay_module_init(void)
 	g_ctx.entry_cache = kmem_cache_create("io_delay_entry",
 					      sizeof(struct delayed_req_entry),
 					      0, SLAB_HWCACHE_ALIGN, NULL);
-	if (!g_ctx.entry_cache) {
-		pr_err("io_delay_kprobe: Failed to create kmem cache\n");
+	if (!g_ctx.entry_cache)
 		return -ENOMEM;
-	}
 
 	hrtimer_init(&g_ctx.delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	g_ctx.delay_timer.function = delay_timer_callback;
@@ -241,14 +241,13 @@ static int __init io_delay_module_init(void)
 
 	ret = register_kprobe(&g_ctx.kp);
 	if (ret < 0) {
-		pr_err("io_delay_kprobe: Failed to register kprobe: %d\n", ret);
 		kmem_cache_destroy(g_ctx.entry_cache);
 		return ret;
 	}
 
 	g_ctx.orig_complete = (nvme_complete_rq_fn)g_ctx.kp.addr;
 	pr_info("io_delay_kprobe: nvme_complete_rq at %px\n", g_ctx.orig_complete);
-	pr_info("io_delay_kprobe: Successfully registered kprobe\n");
+	pr_info("io_delay_kprobe: Module loaded\n");
 
 	return 0;
 }
@@ -260,23 +259,17 @@ static void __exit io_delay_module_exit(void)
 	unsigned long flags;
 	LIST_HEAD(pending_list);
 
-	pr_info("io_delay_kprobe: Shutting down IO delay module\n");
-
 	WRITE_ONCE(delay_enabled, false);
-
 	unregister_kprobe(&g_ctx.kp);
-	pr_info("io_delay_kprobe: Kprobe unregistered\n");
-
 	hrtimer_cancel(&g_ctx.delay_timer);
-	pr_info("io_delay_kprobe: Timer cancelled\n");
 
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
 	list_splice_init(&g_ctx.delay_list, &pending_list);
 	spin_unlock_irqrestore(&g_ctx.delay_lock, flags);
 
-	// kprobe 已注销，int3 已移除，直接调用原函数
 	list_for_each_entry_safe(entry, tmp, &pending_list, list) {
 		list_del(&entry->list);
+		// kprobe 已注销，int3 已移除，直接调用
 		g_ctx.orig_complete(entry->req);
 		kmem_cache_free(g_ctx.entry_cache, entry);
 		atomic64_dec(&g_ctx.stats.current_queue_depth);
