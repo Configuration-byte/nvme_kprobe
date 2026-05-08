@@ -42,6 +42,8 @@ struct io_delay_stats {
 	atomic64_t current_queue_depth;
 };
 
+typedef void (*nvme_complete_rq_fn)(struct request *req);
+
 static struct io_delay_ctx {
 	struct list_head delay_list;
 	spinlock_t delay_lock;
@@ -53,12 +55,22 @@ static struct io_delay_ctx {
 
 	struct kmem_cache *entry_cache;
 
-	void (*orig_nvme_complete_rq)(struct request *req);
+	// 原始函数指针（kp.addr，即函数入口地址）
+	nvme_complete_rq_fn orig_complete;
 
 	struct kprobe kp;
 } g_ctx;
 
 // ==================== 核心处理函数 ====================
+
+// 临时禁用 kprobe，调用原始函数，再恢复 kprobe
+// kp.addr 指向函数入口，disable_kprobe 移除 int3 后可正常调用
+static void call_orig_complete(struct request *req)
+{
+	disable_kprobe(&g_ctx.kp);
+	g_ctx.orig_complete(req);
+	enable_kprobe(&g_ctx.kp);
+}
 
 static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 {
@@ -72,11 +84,9 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	if (!READ_ONCE(delay_enabled))
 		return 0;
 
+	// x86_64 ABI: 第一个参数在 rdi 寄存器
 	req = (struct request *)regs->di;
 	if (!req || !req->q)
-		return 0;
-
-	if (unlikely(!g_ctx.orig_nvme_complete_rq))
 		return 0;
 
 	entry = kmem_cache_alloc(g_ctx.entry_cache, GFP_ATOMIC);
@@ -107,6 +117,7 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	hrtimer_start_range_ns(&g_ctx.delay_timer, entry->trigger_time,
 				0, HRTIMER_MODE_ABS);
 
+	// 返回 1：跳过原始函数执行，请求进入延迟队列
 	return 1;
 }
 
@@ -122,7 +133,8 @@ static void process_expired_entries(struct list_head *expired_list, int max_coun
 			break;
 
 		list_del(&entry->list);
-		g_ctx.orig_nvme_complete_rq(entry->req);
+		// 临时移除 int3 后调用原始函数
+		call_orig_complete(entry->req);
 		kmem_cache_free(g_ctx.entry_cache, entry);
 		atomic64_inc(&g_ctx.stats.total_completed);
 		atomic64_dec(&g_ctx.stats.current_queue_depth);
@@ -142,7 +154,7 @@ static enum hrtimer_restart delay_timer_callback(struct hrtimer *timer)
 
 	now = ktime_get();
 
-	// 收集所有到期的条目
+	// 持锁收集到期条目
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
 
 	list_for_each_entry_safe(entry, tmp, &g_ctx.delay_list, list) {
@@ -151,7 +163,6 @@ static enum hrtimer_restart delay_timer_callback(struct hrtimer *timer)
 		list_move_tail(&entry->list, &expired_list);
 	}
 
-	// 记录下一次触发时间
 	if (!list_empty(&g_ctx.delay_list)) {
 		entry = list_first_entry(&g_ctx.delay_list,
 					 struct delayed_req_entry, list);
@@ -162,10 +173,10 @@ static enum hrtimer_restart delay_timer_callback(struct hrtimer *timer)
 
 	spin_unlock_irqrestore(&g_ctx.delay_lock, flags);
 
-	// 批量处理到期请求
+	// 锁外处理到期请求（调用原始完成函数）
 	process_expired_entries(&expired_list, delay_batch_size);
 
-	// 如果还有剩余（被 max_count 截断），放回队列并重调度
+	// 如果还有剩余（被 batch_size 截断），放回队列
 	if (!list_empty(&expired_list)) {
 		spin_lock_irqsave(&g_ctx.delay_lock, flags);
 		list_splice(&expired_list, &g_ctx.delay_list);
@@ -225,9 +236,9 @@ static int __init io_delay_module_init(void)
 		return ret;
 	}
 
-	g_ctx.orig_nvme_complete_rq = (void *)g_ctx.kp.addr;
-	pr_info("io_delay_kprobe: Original nvme_complete_rq at %px\n",
-		g_ctx.orig_nvme_complete_rq);
+	// kp.addr 即函数入口地址，作为函数指针保存
+	g_ctx.orig_complete = (nvme_complete_rq_fn)g_ctx.kp.addr;
+	pr_info("io_delay_kprobe: nvme_complete_rq at %px\n", g_ctx.orig_complete);
 	pr_info("io_delay_kprobe: Successfully registered kprobe\n");
 
 	return 0;
@@ -242,27 +253,23 @@ static void __exit io_delay_module_exit(void)
 
 	pr_info("io_delay_kprobe: Shutting down IO delay module\n");
 
-	// 先禁用，阻止新的拦截
 	WRITE_ONCE(delay_enabled, false);
 
-	// 注销 kprobe，阻止新的 pre_handler 调用
 	unregister_kprobe(&g_ctx.kp);
 	pr_info("io_delay_kprobe: Kprobe unregistered\n");
 
-	// 取消定时器，等待回调完成
 	hrtimer_cancel(&g_ctx.delay_timer);
 	pr_info("io_delay_kprobe: Timer cancelled\n");
 
-	// 取出所有待处理请求（不持锁调用原始函数）
+	// 取出所有待处理请求
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
 	list_splice_init(&g_ctx.delay_list, &pending_list);
 	spin_unlock_irqrestore(&g_ctx.delay_lock, flags);
 
-	// 在锁外完成所有待处理请求
+	// kprobe 已注销（int3 已移除），直接调用原始函数
 	list_for_each_entry_safe(entry, tmp, &pending_list, list) {
 		list_del(&entry->list);
-		if (g_ctx.orig_nvme_complete_rq)
-			g_ctx.orig_nvme_complete_rq(entry->req);
+		g_ctx.orig_complete(entry->req);
 		kmem_cache_free(g_ctx.entry_cache, entry);
 		atomic64_dec(&g_ctx.stats.current_queue_depth);
 	}
