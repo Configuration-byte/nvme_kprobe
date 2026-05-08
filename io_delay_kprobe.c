@@ -1,4 +1,10 @@
 // io_delay_kprobe.c - 通过 kprobe 拦截 nvme_complete_rq 实现 IO 延迟
+//
+// 原理：
+//   1. kprobe 拦截 nvme_complete_rq，保存请求，返回 1 跳过原函数
+//   2. 更新 req->deadline 阻止块层超时处理器介入
+//   3. hrtimer 到期后，disable_kprobe → 调用原函数 → enable_kprobe
+//
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
@@ -15,11 +21,11 @@ MODULE_DESCRIPTION("IO delay via kprobe on nvme_complete_rq");
 MODULE_VERSION("1.0");
 
 // ==================== 配置参数 ====================
-static unsigned long delay_ns = 10000000UL;  // 默认 10ms 延迟
+static unsigned long delay_ns = 10000000UL;  // 默认 10ms
 module_param(delay_ns, ulong, 0644);
 MODULE_PARM_DESC(delay_ns, "IO completion delay in nanoseconds");
 
-static int delay_batch_size = 64;   // 每批处理数量
+static int delay_batch_size = 64;
 module_param(delay_batch_size, int, 0644);
 MODULE_PARM_DESC(delay_batch_size, "Batch size for delayed completions");
 
@@ -55,16 +61,13 @@ static struct io_delay_ctx {
 
 	struct kmem_cache *entry_cache;
 
-	// 原始函数指针（kp.addr，即函数入口地址）
 	nvme_complete_rq_fn orig_complete;
-
 	struct kprobe kp;
 } g_ctx;
 
 // ==================== 核心处理函数 ====================
 
-// 临时禁用 kprobe，调用原始函数，再恢复 kprobe
-// kp.addr 指向函数入口，disable_kprobe 移除 int3 后可正常调用
+// disable_kprobe 移除 int3，调用原函数，再恢复
 static void call_orig_complete(struct request *req)
 {
 	disable_kprobe(&g_ctx.kp);
@@ -84,7 +87,6 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	if (!READ_ONCE(delay_enabled))
 		return 0;
 
-	// x86_64 ABI: 第一个参数在 rdi 寄存器
 	req = (struct request *)regs->di;
 	if (!req || !req->q)
 		return 0;
@@ -99,6 +101,20 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	now = ktime_get();
 	cur_delay = READ_ONCE(delay_ns);
 	entry->trigger_time = ktime_add_ns(now, cur_delay);
+
+	// 关键：延长 req->deadline，阻止块层超时处理器取消此请求
+	//
+	// 宕机根因：
+	//   kprobe 拦截 nvme_complete_rq 并返回 1 跳过原函数
+	//   → 请求在块层仍标记为 MQ_RQ_IN_FLIGHT
+	//   → 延迟期间，块层 blk_mq_timeout_work 发现 req->deadline 到期
+	//   → 调用 nvme_timeout → nvme_dev_disable → nvme_cancel_tagset
+	//   → 对所有 in-flight 请求调用 blk_mq_end_request
+	//   → blk_end_sync_rq 访问 req->end_io_data（指向调用者栈上的 completion）
+	//   → 调用者栈已被回收 → PTE=0 → 宕机
+	//
+	// 修复：将 deadline 后移 delay + 1秒，确保超时处理器不会在延迟期间触发
+	req->deadline += nsecs_to_jiffies(cur_delay) + HZ;
 
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
 	list_add_tail(&entry->list, &g_ctx.delay_list);
@@ -117,11 +133,9 @@ static int pre_handler_nvme_complete_rq(struct kprobe *p, struct pt_regs *regs)
 	hrtimer_start_range_ns(&g_ctx.delay_timer, entry->trigger_time,
 				0, HRTIMER_MODE_ABS);
 
-	// 返回 1：跳过原始函数执行，请求进入延迟队列
 	return 1;
 }
 
-// 批量完成已到期的请求
 static void process_expired_entries(struct list_head *expired_list, int max_count)
 {
 	struct delayed_req_entry *entry;
@@ -133,7 +147,6 @@ static void process_expired_entries(struct list_head *expired_list, int max_coun
 			break;
 
 		list_del(&entry->list);
-		// 临时移除 int3 后调用原始函数
 		call_orig_complete(entry->req);
 		kmem_cache_free(g_ctx.entry_cache, entry);
 		atomic64_inc(&g_ctx.stats.total_completed);
@@ -154,7 +167,6 @@ static enum hrtimer_restart delay_timer_callback(struct hrtimer *timer)
 
 	now = ktime_get();
 
-	// 持锁收集到期条目
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
 
 	list_for_each_entry_safe(entry, tmp, &g_ctx.delay_list, list) {
@@ -173,10 +185,8 @@ static enum hrtimer_restart delay_timer_callback(struct hrtimer *timer)
 
 	spin_unlock_irqrestore(&g_ctx.delay_lock, flags);
 
-	// 锁外处理到期请求（调用原始完成函数）
 	process_expired_entries(&expired_list, delay_batch_size);
 
-	// 如果还有剩余（被 batch_size 截断），放回队列
 	if (!list_empty(&expired_list)) {
 		spin_lock_irqsave(&g_ctx.delay_lock, flags);
 		list_splice(&expired_list, &g_ctx.delay_list);
@@ -236,7 +246,6 @@ static int __init io_delay_module_init(void)
 		return ret;
 	}
 
-	// kp.addr 即函数入口地址，作为函数指针保存
 	g_ctx.orig_complete = (nvme_complete_rq_fn)g_ctx.kp.addr;
 	pr_info("io_delay_kprobe: nvme_complete_rq at %px\n", g_ctx.orig_complete);
 	pr_info("io_delay_kprobe: Successfully registered kprobe\n");
@@ -261,12 +270,11 @@ static void __exit io_delay_module_exit(void)
 	hrtimer_cancel(&g_ctx.delay_timer);
 	pr_info("io_delay_kprobe: Timer cancelled\n");
 
-	// 取出所有待处理请求
 	spin_lock_irqsave(&g_ctx.delay_lock, flags);
 	list_splice_init(&g_ctx.delay_list, &pending_list);
 	spin_unlock_irqrestore(&g_ctx.delay_lock, flags);
 
-	// kprobe 已注销（int3 已移除），直接调用原始函数
+	// kprobe 已注销，int3 已移除，直接调用原函数
 	list_for_each_entry_safe(entry, tmp, &pending_list, list) {
 		list_del(&entry->list);
 		g_ctx.orig_complete(entry->req);
